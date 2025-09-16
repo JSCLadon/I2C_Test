@@ -1,6 +1,7 @@
-** I2C Test Program for Raspberry Pi Pico
-** This program initialises I2C and the system clocks, then prints the clock frequencies to the console.
-** It also prints "Hello, world!" every second.
+
+// I2C_Test.cpp
+// Simple I2C and Clocks test for Raspberry Pi Pico
+// 2024-06-10 : Igor Petrovic
 
 #include <stdio.h>
 #include "pico/stdlib.h"
