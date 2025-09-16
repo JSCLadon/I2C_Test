@@ -1,136 +1,88 @@
-// I2C_Test.cpp
-// TLV493D Hall sensor readout example for Raspberry Pi Pico
-// 2024-06-10 : Igor Petrovic
-// 2025-09-16 : Updated to talk to Infineon TLV493D via I2C
+// TLV493D Generic Library Example using Raspberry Pi Pico
+// Demonstrates how to talk to a TLV493D-A1B6 Hall sensor via Infineon''s
+// generic TLx493D driver library.
 
-#include <stdio.h>
+#include <cstdio>
 #include "pico/stdlib.h"
-#include "pico/binary_info.h"
 #include "hardware/i2c.h"
 #include "hardware/gpio.h"
-#include "hardware/clocks.h"
 
-#define I2C_PORT i2c0
-#define I2C_SDA 8
-#define I2C_SCL 9
-
-#define TLV493D_I2C_ADDR 0x5EU
-#define TLV493D_FRAME_REG 0x00
-
-static const float TLV493D_SENSITIVITY_MT_PER_LSB = 0.098f;   // ~98 uT/LSB per datasheet
-static const float TLV493D_TEMP_SLOPE_C_PER_LSB = 0.1f;       // datasheet value ~0.1 degC/LSB
-static const float TLV493D_TEMP_OFFSET_C = 25.0f;             // output is relative to 25 degC reference
-
-struct tlv493d_sample {
-    int16_t x_raw;
-    int16_t y_raw;
-    int16_t z_raw;
-    int16_t temperature_raw;
-};
-
-static inline int16_t sign_extend12(uint16_t value)
-{
-    value &= 0x0FFF;
-    if (value & 0x0800) {
-        value |= 0xF000;
-    }
-    return (int16_t)value;
+extern "C" {
+#include "vendor/src/TLx493D/TLx493D.h"
 }
 
-static bool tlv493d_init()
+#include "tlx493d_platform.h"
+
+static void init_i2c_bus()
 {
-    sleep_ms(10);
-
-    uint8_t config[] = {
-        0x06,
-        0x00,
-        0x00,
-        0x02
-    };
-
-    int written = i2c_write_blocking(I2C_PORT, TLV493D_I2C_ADDR, config, sizeof(config), false);
-    return written == sizeof(config);
+    i2c_init(TLX493D_I2C_PORT, TLX493D_I2C_BAUDRATE);
+    gpio_set_function(TLX493D_I2C_SDA, GPIO_FUNC_I2C);
+    gpio_set_function(TLX493D_I2C_SCL, GPIO_FUNC_I2C);
+    gpio_pull_up(TLX493D_I2C_SDA);
+    gpio_pull_up(TLX493D_I2C_SCL);
 }
 
-static bool tlv493d_read_raw(struct tlv493d_sample *sample)
+static float convert_field_to_mT(int16_t raw)
 {
-    uint8_t reg = TLV493D_FRAME_REG;
-    int res = i2c_write_blocking(I2C_PORT, TLV493D_I2C_ADDR, &reg, 1, true);
-    if (res != 1) {
-        return false;
-    }
-
-    uint8_t buffer[6] = {0};
-    res = i2c_read_blocking(I2C_PORT, TLV493D_I2C_ADDR, buffer, sizeof(buffer), false);
-    if (res != sizeof(buffer)) {
-        return false;
-    }
-
-    uint16_t x_raw = ((buffer[1] & 0xF0) << 4) | buffer[0];
-    uint16_t y_raw = ((buffer[1] & 0x0F) << 8) | buffer[2];
-    uint16_t z_raw = ((uint16_t)buffer[3] << 4) | (buffer[4] >> 4);
-    uint16_t t_raw = ((buffer[4] & 0x0F) << 8) | buffer[5];
-
-    sample->x_raw = sign_extend12(x_raw);
-    sample->y_raw = sign_extend12(y_raw);
-    sample->z_raw = sign_extend12(z_raw);
-    sample->temperature_raw = sign_extend12(t_raw);
-
-    return true;
+    // Scaling factor from the TLV493D-A1B6 datasheet
+    return 0.098f * static_cast<float>(raw);
 }
 
-static float tlv493d_to_millitesla(int16_t raw)
+static float convert_temperature_to_c(float raw)
 {
-    return (float)raw * TLV493D_SENSITIVITY_MT_PER_LSB;
-}
-
-static float tlv493d_to_celsius(int16_t raw)
-{
-    return (float)raw * TLV493D_TEMP_SLOPE_C_PER_LSB + TLV493D_TEMP_OFFSET_C;
+    // Conversion formula recommended by Infineon: ((raw - 340) * 1.1) + 25
+    return ((raw - 340.0f) * 1.10f) + 25.0f;
 }
 
 int main()
 {
     stdio_init_all();
+    sleep_ms(200);
 
-    i2c_init(I2C_PORT, 400U * 1000U);
-    gpio_set_function(I2C_SDA, GPIO_FUNC_I2C);
-    gpio_set_function(I2C_SCL, GPIO_FUNC_I2C);
-    gpio_pull_up(I2C_SDA);
-    gpio_pull_up(I2C_SCL);
+    init_i2c_bus();
+    sleep_ms(5);
 
-    bi_decl(bi_2pins_with_func(I2C_SDA, I2C_SCL, GPIO_FUNC_I2C));
-
-    printf("System Clock Frequency is %lu Hz\n", clock_get_hz(clk_sys));
-    printf("USB Clock Frequency is %lu Hz\n", clock_get_hz(clk_usb));
-
-    if (!tlv493d_init()) {
-        printf("Failed to configure TLV493D sensor\n");
+    int32_t status = TLx493D_init();
+    if (status != TLx493D_OK) {
+        printf("TLx493D_init failed (err=%ld)\n", status);
         while (true) {
-            tight_loop_contents();
+            sleep_ms(1000);
         }
     }
 
-    printf("TLV493D ready on I2C0 (%u kHz)\n", 400);
+    TLV493D_sensor_type_t sensor = TLx493D_get_sensor_type();
+    if (sensor != TLx493D_TYPE_TLV_A1B6) {
+        printf("Unexpected sensor type (%d)\n", sensor);
+        while (true) {
+            sleep_ms(1000);
+        }
+    }
 
-    struct tlv493d_sample sample;
+    status = TLx493D_set_operation_mode(TLx493D_OP_MODE_MCM);
+    if (status != TLx493D_OK) {
+        printf("Failed to set measurement mode (err=%ld)\n", status);
+    }
+
+    printf("TLV493D-A1B6 ready\n");
+
+    TLx493D_data_frame_t frame = {};
 
     while (true) {
-        if (tlv493d_read_raw(&sample)) {
-            float x_mT = tlv493d_to_millitesla(sample.x_raw);
-            float y_mT = tlv493d_to_millitesla(sample.y_raw);
-            float z_mT = tlv493d_to_millitesla(sample.z_raw);
-            float temperature_C = tlv493d_to_celsius(sample.temperature_raw);
+        status = TLx493D_read_frame(&frame);
+        if (status == TLx493D_OK) {
+            float bx = convert_field_to_mT(frame.x);
+            float by = convert_field_to_mT(frame.y);
+            float bz = convert_field_to_mT(frame.z);
+            float temp_c = convert_temperature_to_c(static_cast<float>(frame.temp));
 
-            printf("Bx: %.3f mT  By: %.3f mT  Bz: %.3f mT  Temp: %.2f C\n",
-                   x_mT,
-                   y_mT,
-                   z_mT,
-                   temperature_C);
+            printf("Bx %.3f mT, By %.3f mT, Bz %.3f mT, Temp %.2f C\n",
+                   bx, by, bz, temp_c);
+        } else if (status == TLx493D_INVALID_FRAME) {
+            printf("Invalid frame received, retrying...\n");
         } else {
-            printf("I2C read error\n");
+            printf("Frame read failed (err=%ld)\n", status);
         }
 
-        sleep_ms(100);
+        sleep_ms(200);
     }
 }

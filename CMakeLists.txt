@@ -35,7 +35,17 @@ pico_sdk_init()
 
 # Add executable. Default name is the project name, version 0.1
 
-add_executable(I2C_Test I2C_Test.cpp )
+add_executable(I2C_Test
+    I2C_Test.cpp
+    tlx493d_pico_port.c
+    vendor/src/misc/misc.c
+    vendor/src/debug/debug.c
+    vendor/src/TLx493D/TLx493D.c
+    vendor/src/TLx493D/TLV_A1B6/TLV_A1B6.c
+    vendor/src/TLx493D/TLV_A1B6/driver/TLV_A1B6_driver.c
+    vendor/src/TLx493D/TLE_AW2B6/TLE_AW2B6.c
+    vendor/src/TLx493D/TLE_AW2B6/driver/TLE_AW2B6_driver.c
+)
 
 pico_set_program_name(I2C_Test "I2C_Test")
 pico_set_program_version(I2C_Test "0.1")
@@ -51,6 +61,8 @@ target_link_libraries(I2C_Test
 # Add the standard include files to the build
 target_include_directories(I2C_Test PRIVATE
         ${CMAKE_CURRENT_LIST_DIR}
+        ${CMAKE_CURRENT_LIST_DIR}/vendor
+        ${CMAKE_CURRENT_LIST_DIR}/vendor/src
 )
 
 # Add any user requested libraries
