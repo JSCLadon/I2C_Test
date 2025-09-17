@@ -20,7 +20,7 @@ constexpr float kMilliteslaPerRaw = 0.098f;              ///< Datasheet scaling 
 constexpr float kTemperatureSlope = 1.10f;               ///< Datasheet temperature slope (?C / LSB).
 constexpr float kTemperatureOffsetRaw = 340.0f;          ///< Raw offset for TLV493D temperature conversion.
 constexpr float kTemperatureReferenceC = 25.0f;          ///< Reference temperature for conversion output.
-constexpr uint32_t kLoopDelayMs = 50;                    ///< Delay between frame requests in milliseconds.
+constexpr uint32_t kLoopDelayUs = 303;                   ///< Delay between frame requests (~3.3 kHz) in microseconds.
 
 /**
  * @brief Container for a converted TLV493D measurement frame.
@@ -141,6 +141,6 @@ int main()
                    measurement.temp_C);
         }
 
-        sleep_ms(kLoopDelayMs);
+        sleep_us(kLoopDelayUs);
     }
 }
