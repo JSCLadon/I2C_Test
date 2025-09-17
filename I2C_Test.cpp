@@ -13,7 +13,29 @@ extern "C" {
 
 #include "tlx493d_platform.h"
 
-static void init_i2c_bus()
+namespace tlv493d_demo {
+namespace {
+
+constexpr float kMilliteslaPerRaw = 0.098f;              ///< Datasheet scaling from LSB to mT.
+constexpr float kTemperatureSlope = 1.10f;               ///< Datasheet temperature slope (?C / LSB).
+constexpr float kTemperatureOffsetRaw = 340.0f;          ///< Raw offset for TLV493D temperature conversion.
+constexpr float kTemperatureReferenceC = 25.0f;          ///< Reference temperature for conversion output.
+constexpr uint32_t kLoopDelayMs = 50;                    ///< Delay between frame requests in milliseconds.
+
+/**
+ * @brief Container for a converted TLV493D measurement frame.
+ */
+struct Measurement {
+    float bx_mT;   ///< Magnetic field along X in millitesla.
+    float by_mT;   ///< Magnetic field along Y in millitesla.
+    float bz_mT;   ///< Magnetic field along Z in millitesla.
+    float temp_C;  ///< Temperature in degrees Celsius.
+};
+
+/**
+ * @brief Configure the I2C hardware for communicating with the TLV493D sensor.
+ */
+void init_i2c_bus()
 {
     i2c_init(TLX493D_I2C_PORT, TLX493D_I2C_BAUDRATE);
     gpio_set_function(TLX493D_I2C_SDA, GPIO_FUNC_I2C);
@@ -22,67 +44,103 @@ static void init_i2c_bus()
     gpio_pull_up(TLX493D_I2C_SCL);
 }
 
-static float convert_field_to_mT(int16_t raw)
+/**
+ * @brief Convert a raw TLx493D data frame into engineering units.
+ */
+Measurement convert_frame(const TLx493D_data_frame_t &frame)
 {
-    // Scaling factor from the TLV493D-A1B6 datasheet
-    return 0.098f * static_cast<float>(raw);
+    Measurement out{};
+    out.bx_mT = kMilliteslaPerRaw * static_cast<float>(frame.x);
+    out.by_mT = kMilliteslaPerRaw * static_cast<float>(frame.y);
+    out.bz_mT = kMilliteslaPerRaw * static_cast<float>(frame.z);
+    out.temp_C = ((static_cast<float>(frame.temp) - kTemperatureOffsetRaw) * kTemperatureSlope) +
+                 kTemperatureReferenceC;
+    return out;
 }
 
-static float convert_temperature_to_c(float raw)
+/**
+ * @brief Initialise the TLV493D generic driver and select an appropriate operating mode.
+ *
+ * @return true when the sensor has been detected and configured, false otherwise.
+ */
+bool initialize_sensor()
 {
-    // Conversion formula recommended by Infineon: ((raw - 340) * 1.1) + 25
-    return ((raw - 340.0f) * 1.10f) + 25.0f;
+    const int32_t init_result = TLx493D_init();
+    if (init_result != TLx493D_OK) {
+        printf("TLx493D_init failed (err=%ld)\n", init_result);
+        return false;
+    }
+
+    TLV493D_sensor_type_t sensor = TLx493D_get_sensor_type();
+    if (sensor != TLx493D_TYPE_TLV_A1B6) {
+        printf("Unexpected sensor type (%d)\n", sensor);
+        return false;
+    }
+
+    const int32_t mode_result = TLx493D_set_operation_mode(TLx493D_OP_MODE_MCM);
+    if (mode_result != TLx493D_OK) {
+        printf("Failed to set measurement mode (err=%ld)\n", mode_result);
+    }
+
+    return true;
 }
+
+/**
+ * @brief Read and convert a measurement frame from the sensor.
+ *
+ * @param[out] measurement Populated with the converted values on success.
+ * @return true when a fresh frame has been obtained; false on error or invalid frame.
+ */
+bool read_measurement(Measurement &measurement)
+{
+    TLx493D_data_frame_t frame{};
+    const int32_t status = TLx493D_read_frame(&frame);
+
+    if (status == TLx493D_OK) {
+        measurement = convert_frame(frame);
+        return true;
+    }
+
+    if (status == TLx493D_INVALID_FRAME) {
+        printf("Invalid frame received, retrying...\n");
+    } else {
+        printf("Frame read failed (err=%ld)\n", status);
+    }
+
+    return false;
+}
+
+} // namespace
+} // namespace tlv493d_demo
 
 int main()
 {
+    using namespace tlv493d_demo;
+
     stdio_init_all();
     sleep_ms(200);
 
     init_i2c_bus();
     sleep_ms(5);
 
-    int32_t status = TLx493D_init();
-    if (status != TLx493D_OK) {
-        printf("TLx493D_init failed (err=%ld)\n", status);
+    if (!initialize_sensor()) {
         while (true) {
             sleep_ms(1000);
         }
-    }
-
-    TLV493D_sensor_type_t sensor = TLx493D_get_sensor_type();
-    if (sensor != TLx493D_TYPE_TLV_A1B6) {
-        printf("Unexpected sensor type (%d)\n", sensor);
-        while (true) {
-            sleep_ms(1000);
-        }
-    }
-
-    status = TLx493D_set_operation_mode(TLx493D_OP_MODE_MCM);
-    if (status != TLx493D_OK) {
-        printf("Failed to set measurement mode (err=%ld)\n", status);
     }
 
     printf("TLV493D-A1B6 ready\n");
 
-    TLx493D_data_frame_t frame = {};
-
+    Measurement measurement{};
     while (true) {
-        status = TLx493D_read_frame(&frame);
-        if (status == TLx493D_OK) {
-            float bx = convert_field_to_mT(frame.x);
-            float by = convert_field_to_mT(frame.y);
-            float bz = convert_field_to_mT(frame.z);
-            float temp_c = convert_temperature_to_c(static_cast<float>(frame.temp));
-
+        if (read_measurement(measurement)) {
             printf("Bx %.3f mT, By %.3f mT, Bz %.3f mT, Temp %.2f C\n",
-                   bx, by, bz, temp_c);
-        } else if (status == TLx493D_INVALID_FRAME) {
-            printf("Invalid frame received, retrying...\n");
-        } else {
-            printf("Frame read failed (err=%ld)\n", status);
+                   measurement.bx_mT,
+                   measurement.by_mT,
+                   measurement.bz_mT,
+                   measurement.temp_C);
         }
 
-        sleep_ms(200);
+        sleep_ms(kLoopDelayMs);
     }
 }
