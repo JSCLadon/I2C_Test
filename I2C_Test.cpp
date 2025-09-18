@@ -1,6 +1,7 @@
 ﻿// TLV493D Generic Library Example using Raspberry Pi Pico
 // Demonstrates how to talk to a TLV493D-A1B6 Hall sensor via Infineon's
 // generic TLx493D driver library.
+// This is the latest version.
 
 #include <cstddef>
 #include <cstdint>
