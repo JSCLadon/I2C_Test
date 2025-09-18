@@ -1,11 +1,15 @@
-// TLV493D Generic Library Example using Raspberry Pi Pico
-// Demonstrates how to talk to a TLV493D-A1B6 Hall sensor via Infineon''s
+﻿// TLV493D Generic Library Example using Raspberry Pi Pico
+// Demonstrates how to talk to a TLV493D-A1B6 Hall sensor via Infineon's
 // generic TLx493D driver library.
 
+#include <cstddef>
+#include <cstdint>
 #include <cstdio>
+#include <cstring>
 #include "pico/stdlib.h"
 #include "hardware/i2c.h"
 #include "hardware/gpio.h"
+#include "pico/stdio_usb.h"
 
 extern "C" {
 #include "vendor/src/TLx493D/TLx493D.h"
@@ -21,6 +25,11 @@ constexpr float kTemperatureSlope = 1.10f;               ///< Datasheet temperat
 constexpr float kTemperatureOffsetRaw = 340.0f;          ///< Raw offset for TLV493D temperature conversion.
 constexpr float kTemperatureReferenceC = 25.0f;          ///< Reference temperature for conversion output.
 constexpr uint32_t kLoopDelayUs = 303;                   ///< Delay between frame requests (~3.3 kHz) in microseconds.
+constexpr size_t kMeasurementBufferCapacity = 256;       ///< USB transmit queue depth.
+constexpr uint32_t kMeasurementPacketMagic = 0x544C564D; ///< "TLVM" marker for measurement packets.
+constexpr size_t kMeasurementPacketSize = 36;            ///< Measurement packet size in bytes.
+constexpr uint32_t kStatusPacketMagic = 0x544C5653;      ///< "TLVS" marker for status packets.
+constexpr size_t kStatusPacketSize = 12;                 ///< Status packet size in bytes.
 
 /**
  * @brief Container for a converted TLV493D measurement frame.
@@ -31,6 +40,129 @@ struct Measurement {
     float bz_mT;   ///< Magnetic field along Z in millitesla.
     float temp_C;  ///< Temperature in degrees Celsius.
 };
+
+struct BufferedMeasurement {
+    Measurement measurement;
+    uint64_t timestamp_us;
+    uint32_t sequence;
+};
+
+class MeasurementBuffer {
+public:
+    bool push(const BufferedMeasurement &entry)
+    {
+        bool clean_insert = true;
+        if (count_ == kMeasurementBufferCapacity) {
+            // Drop the oldest entry to make room for the newest measurement.
+            tail_ = advance_index(tail_);
+            --count_;
+            clean_insert = false;
+        }
+
+        storage_[head_] = entry;
+        head_ = advance_index(head_);
+        ++count_;
+        return clean_insert;
+    }
+
+    bool peek(BufferedMeasurement &entry) const
+    {
+        if (count_ == 0) {
+            return false;
+        }
+        entry = storage_[tail_];
+        return true;
+    }
+
+    void pop()
+    {
+        if (count_ == 0) {
+            return;
+        }
+        tail_ = advance_index(tail_);
+        --count_;
+    }
+
+    bool empty() const
+    {
+        return count_ == 0;
+    }
+
+private:
+    static size_t advance_index(size_t index)
+    {
+        ++index;
+        if (index == kMeasurementBufferCapacity) {
+            index = 0;
+        }
+        return index;
+    }
+
+    BufferedMeasurement storage_[kMeasurementBufferCapacity]{};
+    size_t head_ = 0;
+    size_t tail_ = 0;
+    size_t count_ = 0;
+};
+
+MeasurementBuffer g_measurement_buffer;
+uint32_t g_measurement_sequence = 0;
+uint32_t g_measurement_overflows = 0;
+
+void write_u32_le(uint8_t *dest, uint32_t value)
+{
+    dest[0] = static_cast<uint8_t>(value & 0xFFu);
+    dest[1] = static_cast<uint8_t>((value >> 8) & 0xFFu);
+    dest[2] = static_cast<uint8_t>((value >> 16) & 0xFFu);
+    dest[3] = static_cast<uint8_t>((value >> 24) & 0xFFu);
+}
+
+void write_u64_le(uint8_t *dest, uint64_t value)
+{
+    for (int i = 0; i < 8; ++i) {
+        dest[i] = static_cast<uint8_t>((value >> (8 * i)) & 0xFFu);
+    }
+}
+
+void write_float_le(uint8_t *dest, float value)
+{
+    uint32_t bits = 0;
+    std::memcpy(&bits, &value, sizeof(bits));
+    write_u32_le(dest, bits);
+}
+
+uint32_t compute_crc32(const uint8_t *data, size_t length)
+{
+    uint32_t crc = 0xFFFFFFFFu;
+    for (size_t i = 0; i < length; ++i) {
+        crc ^= data[i];
+        for (int bit = 0; bit < 8; ++bit) {
+            const uint32_t mask = -(crc & 1u);
+            crc = (crc >> 1) ^ (0xEDB88320u & mask);
+        }
+    }
+    return ~crc;
+}
+
+void encode_measurement_packet(const BufferedMeasurement &entry, uint8_t *buffer)
+{
+    write_u32_le(buffer + 0, kMeasurementPacketMagic);
+    write_u32_le(buffer + 4, entry.sequence);
+    write_u64_le(buffer + 8, entry.timestamp_us);
+    write_float_le(buffer + 16, entry.measurement.bx_mT);
+    write_float_le(buffer + 20, entry.measurement.by_mT);
+    write_float_le(buffer + 24, entry.measurement.bz_mT);
+    write_float_le(buffer + 28, entry.measurement.temp_C);
+    const uint32_t checksum = compute_crc32(buffer, kMeasurementPacketSize - sizeof(uint32_t));
+    write_u32_le(buffer + (kMeasurementPacketSize - sizeof(uint32_t)), checksum);
+}
+
+void encode_status_packet(uint32_t overflow_count, uint8_t *buffer)
+{
+    write_u32_le(buffer + 0, kStatusPacketMagic);
+    write_u32_le(buffer + 4, overflow_count);
+    const uint32_t checksum = compute_crc32(buffer, kStatusPacketSize - sizeof(uint32_t));
+    write_u32_le(buffer + (kStatusPacketSize - sizeof(uint32_t)), checksum);
+}
 
 /**
  * @brief Configure the I2C hardware for communicating with the TLV493D sensor.
@@ -110,6 +242,60 @@ bool read_measurement(Measurement &measurement)
     return false;
 }
 
+void queue_measurement_for_usb(const Measurement &measurement)
+{
+    const BufferedMeasurement entry{
+        measurement,
+        static_cast<uint64_t>(to_us_since_boot(get_absolute_time())),
+        g_measurement_sequence++,
+    };
+
+    if (!g_measurement_buffer.push(entry)) {
+        ++g_measurement_overflows;
+    }
+}
+
+bool flush_overflow_status()
+{
+    if (g_measurement_overflows == 0) {
+        return true;
+    }
+
+    uint8_t status_packet[kStatusPacketSize];
+    encode_status_packet(g_measurement_overflows, status_packet);
+
+    const size_t written = fwrite(status_packet, 1, kStatusPacketSize, stdout);
+    if (written != kStatusPacketSize) {
+        return false;
+    }
+
+    g_measurement_overflows = 0;
+    return true;
+}
+
+void flush_measurement_buffer_to_usb()
+{
+    if (!stdio_usb_connected()) {
+        return;
+    }
+
+    BufferedMeasurement entry{};
+    while (g_measurement_buffer.peek(entry)) {
+        uint8_t packet[kMeasurementPacketSize];
+        encode_measurement_packet(entry, packet);
+
+        const size_t written = fwrite(packet, 1, kMeasurementPacketSize, stdout);
+        if (written != kMeasurementPacketSize) {
+            break;
+        }
+
+        g_measurement_buffer.pop();
+    }
+
+    flush_overflow_status();
+    fflush(stdout);
+}
+
 } // namespace
 } // namespace tlv493d_demo
 
@@ -119,6 +305,11 @@ int main()
 
     stdio_init_all();
     sleep_ms(200);
+
+    // Give the USB host a moment to enumerate before continuing.
+    for (int i = 0; i < 200 && !stdio_usb_connected(); ++i) {
+        sleep_ms(5);
+    }
 
     init_i2c_bus();
     sleep_ms(5);
@@ -134,13 +325,10 @@ int main()
     Measurement measurement{};
     while (true) {
         if (read_measurement(measurement)) {
-            printf("Bx %.3f mT, By %.3f mT, Bz %.3f mT, Temp %.2f C\n",
-                   measurement.bx_mT,
-                   measurement.by_mT,
-                   measurement.bz_mT,
-                   measurement.temp_C);
+            queue_measurement_for_usb(measurement);
         }
 
+        flush_measurement_buffer_to_usb();
         sleep_us(kLoopDelayUs);
     }
 }
